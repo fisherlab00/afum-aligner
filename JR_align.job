@@ -1,0 +1,156 @@
+#!/bin/bash
+#PBS -l walltime=72:00:00
+#PBS -l select=1:ncpus=10:mem=60gb
+#PBS -N zJR_ALIGN
+#PBS -J 1-97
+# 1-97
+# Modified script from Johanna Rhodes to run on latest HPC Cluster
+# https://github.com/mycologenomics/WGSpipeline
+eval "$(~/anaconda3/bin/conda shell.bash hook)"
+# Input must be tab-delimited containing the following:
+# forward_read  reverse_read    prefix  output_folder
+
+
+LINE=$(sed -n "${PBS_ARRAY_INDEX}p" "/rds/general/user/hchown/projects/fisher-aspergillus-analysis/live/harry/alignment_JR_style/scripts/failed.txt" )
+R1=$(echo "$LINE" | awk '{print $1}')
+R2=$(echo "$LINE" | awk '{print $2}')
+
+PREFIX=$(echo "$LINE" | awk '{print $3}')
+results_dir=$(echo "$LINE" | awk '{print $4}')
+
+## Versions used:
+## BWA aligner: 0.7.15
+## SAMTools: 1.16.1
+## Picard: 2.27.4
+## GATK: 4.2.6.1
+#####################################################################
+
+
+
+reference_dir=/rds/general/project/fisher-aspergillus-reference/live
+reference=$reference_dir/GCF_000002655.1_ASM265v1_genomic.fa
+output=/rds/general/user/hchown/ephemeral/$PREFIX
+tmp=/rds/general/user/hchown/ephemeral/
+
+cd $TMPDIR
+
+mkdir -p -v $output
+mkdir -p $results_dir
+## copy files over to local scratch
+
+cp -v $R1 $output/R1.fastq.gz
+cp -v $R2 $output/R2.fastq.gz
+cp -v $reference $output/ref.fa
+
+reference=$(echo "${output}/ref.fa")
+ref_dict=$(echo "${output}/ref.dict")
+
+
+conda activate JR_align
+# Make a new reference indexes
+samtools faidx $reference
+bwa index $reference
+picard CreateSequenceDictionary -R $reference -O $ref_dict
+
+bwa mem -M $reference $output/R1.fastq.gz $output/R2.fastq.gz > $output/$PREFIX.sam
+
+
+#samtools import $reference.fai $output/$PREFIX.sam $output/$PREFIX.bam
+
+samtools view -b -S $output/$PREFIX.sam > $output/$PREFIX.bam
+
+samtools sort $output/$PREFIX.bam -o $output/$PREFIX.sorted.bam
+samtools index $output/$PREFIX.sorted.bam
+
+
+# Identify read groups automatically
+gunzip $output/R1.fastq.gz
+READ_HEADER=$( head -n1 $output/R1.fastq )
+RGID=$(echo "$READ_HEADER" | cut -d":" -f1 | sed 's/@//g')
+rgpu=$(echo "$READ_HEADER" | cut -d":" -f2 | sed 's/@//g')
+rgid=$(echo "${RGID}-${PREFIX}-${rgpu}")
+gzip $output/R1.fastq
+
+picard AddOrReplaceReadGroups INPUT=$output/$PREFIX.sorted.bam OUTPUT=$output/$PREFIX.fixed.bam SORT_ORDER=coordinate RGID=$rgid RGLB=dnaseq RGPL=illumina RGSM=WGS RGPU=$rgpu CREATE_INDEX=TRUE VALIDATION_STRINGENCY=SILENT TMP_DIR=$output
+
+picard MarkDuplicates INPUT=$output/$PREFIX.fixed.bam OUTPUT=$output/$PREFIX.sorted.marked.bam METRICS_FILE=$output/picard_info.txt REMOVE_DUPLICATES=false ASSUME_SORTED=true VALIDATION_STRINGENCY=SILENT CREATE_INDEX=TRUE TMP_DIR=$output
+
+
+#Call variants
+gatk HaplotypeCaller --tmp-dir $output -R $reference -I $output/$PREFIX.sorted.marked.bam -O $output/$PREFIX.raw_variants.vcf --pcr-indel-model NONE -ploidy 1 -stand-call-conf 30 -mbq 20 -A QualByDepth -XL $reference_dir/GCF_000002655.1_ASM265v1_genomic.repeat.intervals 
+
+#Extract SNPs and INDELs
+gatk SelectVariants --tmp-dir $output -R $reference -V $output/$PREFIX.raw_variants.vcf --select-type-to-include SNP -O $output/$PREFIX.raw_snps.vcf 
+
+gatk SelectVariants --tmp-dir $output -R $reference -V $output/$PREFIX.raw_variants.vcf --select-type-to-include INDEL -O $output/$PREFIX.raw_indels.vcf 
+
+#Filter SNPs and INDELs
+gatk VariantFiltration --tmp-dir $output -R $reference -V $output/$PREFIX.raw_snps.vcf --filter-expression "QD < 2.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0 || SOR > 4.0" --filter-name LowConf -O $output/$PREFIX.filtered_snps.vcf 
+
+gatk VariantFiltration --tmp-dir $output -R $reference -V $output/$PREFIX.raw_indels.vcf --filter-expression "QD < 2.0 || FS > 200.0 || ReadPosRankSum < -20.0 || SOR > 10.0" --filter-name LowConf -O $output/$PREFIX.filtered_indels.vcf 
+#Base Quality Score Recalibration (BQSR) #1
+gatk BaseRecalibrator --tmp-dir $output -R $reference -I $output/$PREFIX.sorted.marked.bam --known-sites $output/$PREFIX.filtered_snps.vcf --known-sites $output/$PREFIX.filtered_indels.vcf -O $output/$PREFIX.recal_data.table 
+
+#Apply BQSR #1
+gatk ApplyBQSR --tmp-dir $output -R $reference -I $output/$PREFIX.sorted.marked.bam --bqsr-recal-file $output/$PREFIX.recal_data.table -O $output/$PREFIX.recal_reads.bam 
+
+#Base Quality Score Recalibration (BQSR) #2
+gatk BaseRecalibrator --tmp-dir $output -R $reference -I $output/$PREFIX.recal_reads.bam --known-sites $output/$PREFIX.filtered_snps.vcf --known-sites $output/$PREFIX.filtered_indels.vcf -O $output/$PREFIX.post_recal_data.table 
+
+#Apply BQSR
+gatk ApplyBQSR --tmp-dir $output -R $reference -I $output/$PREFIX.recal_reads.bam -O $output/$PREFIX.post_recal_reads.bam --bqsr-recal-file $output/$PREFIX.post_recal_data.table 
+
+#Remove extra files
+#rm $output/$PREFIX.sorted.marked.ba*
+
+#Call variants (again)
+gatk HaplotypeCaller --tmp-dir $output -R $reference -I $output/$PREFIX.post_recal_reads.bam -O $output/$PREFIX.raw_variants_recal.vcf -ERC GVCF --pcr-indel-model NONE -ploidy 1 -stand-call-conf 30 -mbq 20 -A QualByDepth -XL $reference_dir/GCF_000002655.1_ASM265v1_genomic.repeat.intervals  
+
+#Genotype gVCF
+gatk GenotypeGVCFs --tmp-dir $output -R $reference -V $output/$PREFIX.raw_variants_recal.vcf -O $output/$PREFIX.genotyped_variants_recal.vcf
+
+#Extract SNPs for stats purposes
+gatk SelectVariants --tmp-dir $output -R $reference -V $output/$PREFIX.genotyped_variants_recal.vcf --select-type-to-include SNP -O $output/$PREFIX.raw_snps_stats.vcf
+
+#Extract SNPs and INDELs
+gatk SelectVariants --tmp-dir $output -R $reference -V $output/$PREFIX.genotyped_variants_recal.vcf --select-type-to-include SNP -O $output/$PREFIX.raw_snps_recal.vcf -select 'vc.getGenotype("WGS").getAD().1*1.0 / vc.getGenotype("WGS").getDP() > 0.90'
+
+gatk SelectVariants --tmp-dir $output -R $reference -V $output/$PREFIX.genotyped_variants_recal.vcf --select-type-to-include INDEL -O $output/$PREFIX.raw_indels_recal.vcf 
+
+#Filter SNPs
+gatk VariantFiltration --tmp-dir $output -R $reference -V $output/$PREFIX.raw_snps_recal.vcf -filter "QD < 2.0" --filter-name "LowConf" -filter "FS > 60.0" --filter-name "LowConf" -filter "MQ < 40.0" --filter-name "LowConf" -filter "MQRankSum < -12.5" --filter-name "LowConf" -filter "ReadPosRankSum < -8.0" --filter-name "LowConf" -filter "SOR > 4.0" --filter-name "LowConf" -filter "DP < 5" --filter-name "LowConf" -G-filter "GQ < 50" -G-filter-name "FILTER_GQ-50" -O $output/$PREFIX.filtered_snps_final.vcf 
+
+#Filter INDELs
+gatk VariantFiltration --tmp-dir $output -R $reference -V $output/$PREFIX.raw_indels_recal.vcf -filter "QD < 2.0" --filter-name "LowConf" -filter "FS > 200.0" --filter-name "LowConf" -filter "ReadPosRankSum < -20.0" --filter-name "LowConf" -filter "SOR > 10.0" --filter-name "LowConf" -O $output/$PREFIX.filtered_indels_final.vcf 
+
+grep PASS $output/$PREFIX.filtered_snps_final.vcf | awk '$4=="A"||$4=="C"||$4=="G"||$4=="T"' | awk '$5=="A"||$5=="C"||$5=="G"||$5=="T"' > $output/$PREFIX.final_snps.body 
+grep "#" $output/$PREFIX.filtered_snps_final.vcf > $output/$PREFIX.final.head
+cat $output/$PREFIX.final.head $output/$PREFIX.final_snps.body > $output/$PREFIX.final_snps.vcf
+
+grep PASS $output/$PREFIX.filtered_indels_final.vcf | awk '$4=="A"||$4=="C"||$4=="G"||$4=="T"' | awk '$5=="A"||$5=="C"||$5=="G"||$5=="T"' > $output/$PREFIX.final_indels.body
+grep "#" $output/$PREFIX.filtered_indels_final.vcf > $output/$PREFIX.final_indels.head
+cat $output/$PREFIX.final_indels.head $output/$PREFIX.final_indels.body > $output/$PREFIX.final_indels.vcf
+
+#Calculate depth of coverage
+picard CollectWgsMetrics I=$output/$PREFIX.post_recal_reads.bam O=$results_dir/$PREFIX.metrics.txt R=$reference TMP_DIR=$output
+
+#Collect mapping statistics
+samtools flagstat $output/$PREFIX.post_recal_reads.bam > $output/flagstat
+
+cp -v $output/$PREFIX.genotyped_variants_recal.vcf $results_dir
+cp -v $output/$PREFIX.post_recal_reads.bam $results_dir
+cp -v $output/$PREFIX.post_recal_reads.bai $results_dir
+cp -v $output/$PREFIX.raw_variants_recal.vcf $results_dir
+cp -v $output/$PREFIX.raw_snps_recal.vcf $results_dir
+cp -v $output/$PREFIX.raw_indels_recal.vcf $results_dir
+cp -v $output/$PREFIX.final_indels.vcf $results_dir
+cp -v $output/$PREFIX.final_snps.vcf $results_dir
+cp -v $output/flagstat $results_dir
+cp -v $output/$PREFIX.filtered_snps_final.vcf $results_dir
+cp -v $output/$PREFIX.raw_snps_stats.vcf $results_dir
+
+
+rm $output/$PREFIX.sam
+rm $output/$PREFIX.bam 
+
+
