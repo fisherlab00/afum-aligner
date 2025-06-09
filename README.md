@@ -14,11 +14,10 @@ Short-read sequence alignment, SNP-calling and downstream processing pipeline(s)
 
 These can be installed by creating respective Conda environments from the YAML files in the `envs/` folder.
 ```bash
-conda env create -f envs/JR_align
+conda env create -f envs/JR_align.yaml
 ```
 
 ## Tutorial
-
 
 
 ### Contributing 
