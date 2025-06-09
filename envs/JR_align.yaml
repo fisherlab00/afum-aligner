@@ -1,0 +1,11 @@
+name: JR_align
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - ursky
+dependencies:
+  - bwa=0.7.15
+  - gatk4=4.2.6.1
+  - picard=2.27.4
+  - samtools=1.16.1
