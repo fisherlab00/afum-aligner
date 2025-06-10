@@ -1,0 +1,17 @@
+#!/bin/bash
+#PBS -lwalltime=72:00:00
+#PBS -l select=1:ncpus=32:mem=124gb
+#PBS -N zJR_TREE
+
+# Modified script from Johanna Rhodes to run on latest HPC Cluster
+# https://github.com/mycologenomics/WGSpipeline
+eval "$(~/anaconda3/bin/conda shell.bash hook)"
+
+## Versions used:
+## RAxML-NG: v1.2.1
+
+#####################################################################
+
+conda activate raxml-ng
+
+raxml-ng --seed 2 --msa /rds/general/project/fisher-aspergillus-results/live/NERC_GLOBAL_SNPs/NERC_GLOBAL_SNPs.fa --threads 32 --model GTR+G --prefix /rds/general/project/fisher-aspergillus-results/live/NERC_GLOBAL_SNPs/NERC_raxml-ng

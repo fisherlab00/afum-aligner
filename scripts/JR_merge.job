@@ -1,0 +1,43 @@
+#!/bin/bash
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=10:mem=60gb
+#PBS -N zJR_MERGE
+
+# Modified script from Johanna Rhodes to run on latest HPC Cluster
+# https://github.com/mycologenomics/WGSpipeline
+eval "$(~/anaconda3/bin/conda shell.bash hook)"
+# Input must be tab-delimited containing the following:
+# forward_read  reverse_read    prefix  output_folder
+
+
+## Versions used:
+## vcftools: v0.1.16
+## tabix: v1.21
+## bcftools: v1.10.2
+#####################################################################
+
+tmp=/rds/general/user/hchown/ephemeral/
+VCF_FOLDER=/rds/general/project/fisher-aspergillus-results/live/NERC_GLOBAL_SNPs
+
+conda activate JR_merge
+:<<'END'
+# Generate multi-VCF
+VCF_FOLDER=/rds/general/project/fisher-aspergillus-results/live/NERC_GLOBAL_SNPs
+for file in $VCF_FOLDER/*.vcf
+do
+bgzip $file
+tabix -p vcf $file.gz
+done
+
+vcf-merge -R 0 $VCF_FOLDER/*.gz > $VCF_FOLDER/NERC_GLOBAL_SNPs.vcf 
+END
+# Create FASTA
+
+vcf=$(echo "$VCF_FOLDER/NERC_GLOBAL_SNPs.vcf") 
+
+for samp in $(bcftools query -l ${vcf})
+do
+printf '>'${samp}'\n'
+bcftools query -s ${samp} -f '[%TGT]' ${vcf}
+printf '\n'
+done > /rds/general/project/fisher-aspergillus-results/live/NERC_GLOBAL_SNPs/NERC_GLOBAL_SNPs.fa
